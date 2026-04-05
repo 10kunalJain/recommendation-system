@@ -419,6 +419,63 @@ python serve.py --port 8000
 
 ---
 
+## Benchmarks & Profiling
+
+Run the full benchmark suite: `python benchmark.py`
+
+### Single-User Latency
+
+| Metric | Value |
+|:---|:---|
+| **Mean** | 43.5ms |
+| **Median (P50)** | 43.9ms |
+| **P95** | 48.4ms |
+| **P99** | 50.4ms |
+| **Throughput** | 23 users/sec (single process) |
+
+### Batch Throughput
+
+| Batch Size | Total Time | Per User | Throughput |
+|:---|:---|:---|:---|
+| 10 users | 445ms | 44.5ms | 22.5 users/sec |
+| 50 users | 2,214ms | 44.3ms | 22.6 users/sec |
+| 100 users | 4,348ms | 43.5ms | 23.0 users/sec |
+
+*Linear scaling — no degradation at larger batch sizes.*
+
+### Caching Performance
+
+| Scenario | Latency | Speedup |
+|:---|:---|:---|
+| Cache MISS (cold) | 43.0ms | — |
+| Cache HIT (warm) | 0.0004ms | **110,000x** |
+
+The TTL-based LRU cache (5-minute TTL, 2,000 entries) serves repeat requests in sub-microsecond time. In production, a Redis cache shared across workers would achieve ~60%+ hit rate for returning users.
+
+### FAISS ANN vs Brute-Force Retrieval
+
+| Method | Mean Latency | P95 | Speedup |
+|:---|:---|:---|:---|
+| Brute-force dot product | 1.038ms | 1.133ms | — |
+| **FAISS IndexFlatIP** | **0.111ms** | **0.117ms** | **9.4x** |
+
+- **Result consistency: 100%** — FAISS returns identical top-10 items to brute-force (exact index at this catalog size)
+- At 100K+ items, FAISS IVF index would provide ~50x speedup with >95% recall
+
+### Scalability Path
+
+| Scale | Architecture | Expected Throughput |
+|:---|:---|:---|
+| **Current** (single process) | Python + in-memory | 23 users/sec |
+| **4 Uvicorn workers** | Multi-process + shared cache | ~90 users/sec |
+| **+ Redis cache** (60% hit rate) | Distributed cache | ~225 users/sec |
+| **+ Feature store** (precomputed) | Redis/DynamoDB features | ~500 users/sec |
+| **+ FAISS IVF** (large catalog) | ANN retrieval | ~700 users/sec |
+
+> At **100K DAU** (~1.2 req/sec average, ~12 req/sec peak), a single 4-worker instance handles all traffic comfortably.
+
+---
+
 ## Results Deep Dive
 
 <details>

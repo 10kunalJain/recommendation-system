@@ -4,14 +4,17 @@ Production design decisions:
 1. Precomputed candidates cached in memory (ALS embeddings, popularity)
 2. Ranking model loaded once at startup
 3. Per-request feature assembly + ranking takes <50ms
-4. LRU cache for repeat users (TTL-based eviction)
+4. TTL-based LRU cache for repeat users — avoids recomputation
 5. Batch endpoint for bulk recommendation generation
+6. FAISS ANN index for sub-millisecond Two-Tower retrieval
 
 This is the interface between the ML system and the product.
 """
 
 import time
-from functools import lru_cache
+import hashlib
+from collections import OrderedDict
+from threading import Lock
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +32,66 @@ app = FastAPI(
 # Global model registry — populated at startup
 MODEL_REGISTRY = {}
 
+
+# ---- TTL-aware LRU Cache ----
+
+class TTLCache:
+    """Thread-safe LRU cache with time-to-live eviction.
+
+    Why not functools.lru_cache?
+    - lru_cache has no TTL — stale recommendations persist forever
+    - We need per-user invalidation when new purchases arrive
+    - Thread-safe for concurrent uvicorn workers
+    """
+
+    def __init__(self, max_size: int = 1000, ttl_seconds: int = 300):
+        self.max_size = max_size
+        self.ttl = ttl_seconds
+        self._cache: OrderedDict[str, tuple[float, any]] = OrderedDict()
+        self._lock = Lock()
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, key: str):
+        with self._lock:
+            if key in self._cache:
+                ts, value = self._cache[key]
+                if time.time() - ts < self.ttl:
+                    self._cache.move_to_end(key)
+                    self.hits += 1
+                    return value
+                else:
+                    del self._cache[key]
+            self.misses += 1
+            return None
+
+    def put(self, key: str, value):
+        with self._lock:
+            if key in self._cache:
+                del self._cache[key]
+            self._cache[key] = (time.time(), value)
+            if len(self._cache) > self.max_size:
+                self._cache.popitem(last=False)
+
+    def invalidate(self, key: str):
+        with self._lock:
+            self._cache.pop(key, None)
+
+    @property
+    def stats(self) -> dict:
+        total = self.hits + self.misses
+        return {
+            "size": len(self._cache),
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate": self.hits / total if total > 0 else 0,
+        }
+
+
+rec_cache = TTLCache(max_size=2000, ttl_seconds=300)
+
+
+# ---- Pydantic Models ----
 
 class RecommendationRequest(BaseModel):
     customer_id: str
@@ -50,6 +113,7 @@ class RecommendationResponse(BaseModel):
     recommendations: list[RecommendationItem]
     is_cold_start: bool
     latency_ms: float
+    cache_hit: bool = False
     model_version: str = "v1"
 
 
@@ -58,12 +122,22 @@ class BatchRequest(BaseModel):
     n_recommendations: int = 12
 
 
+class BatchResponse(BaseModel):
+    recommendations: dict[str, list[str]]
+    total_latency_ms: float
+    avg_latency_ms: float
+    cache_hits: int
+
+
 class HealthResponse(BaseModel):
     status: str
     models_loaded: list[str]
     n_users: int
     n_items: int
+    cache_stats: dict
 
+
+# ---- Endpoints ----
 
 @app.get("/health", response_model=HealthResponse)
 def health_check():
@@ -73,6 +147,7 @@ def health_check():
         models_loaded=list(MODEL_REGISTRY.keys()),
         n_users=MODEL_REGISTRY.get("n_users", 0),
         n_items=MODEL_REGISTRY.get("n_items", 0),
+        cache_stats=rec_cache.stats,
     )
 
 
@@ -81,11 +156,25 @@ def get_recommendations(request: RecommendationRequest):
     """Get personalized recommendations for a single user.
 
     Two-stage pipeline:
-    1. Candidate generation (ALS + content + popularity + recency)
+    1. Candidate generation (ALS + Two-Tower + content + popularity + recency)
     2. Ranking (LightGBM LambdaRank)
-    + Optional MMR diversity re-ranking
+    + Category diversity re-ranking
+    + TTL-based caching (5 min)
     """
     start_time = time.time()
+
+    # Check cache
+    cache_key = f"{request.customer_id}:{request.n_recommendations}"
+    cached = rec_cache.get(cache_key)
+    if cached is not None:
+        latency = (time.time() - start_time) * 1000
+        return RecommendationResponse(
+            customer_id=request.customer_id,
+            recommendations=cached["items"],
+            is_cold_start=cached["is_cold_start"],
+            latency_ms=round(latency, 2),
+            cache_hit=True,
+        )
 
     pipeline = MODEL_REGISTRY.get("pipeline")
     if pipeline is None:
@@ -108,13 +197,18 @@ def get_recommendations(request: RecommendationRequest):
             for i, row in result.iterrows()
         ]
 
+        is_cold = result.attrs.get("is_cold_start", False) if hasattr(result, "attrs") else False
+
+        # Store in cache
+        rec_cache.put(cache_key, {"items": items, "is_cold_start": is_cold})
+
         latency = (time.time() - start_time) * 1000
         return RecommendationResponse(
             customer_id=request.customer_id,
             recommendations=items,
-            is_cold_start=result.attrs.get("is_cold_start", False)
-            if hasattr(result, "attrs") else False,
+            is_cold_start=is_cold,
             latency_ms=round(latency, 2),
+            cache_hit=False,
         )
 
     except KeyError:
@@ -123,7 +217,7 @@ def get_recommendations(request: RecommendationRequest):
         )
 
 
-@app.post("/recommend/batch")
+@app.post("/recommend/batch", response_model=BatchResponse)
 def get_batch_recommendations(request: BatchRequest):
     """Batch recommendations for multiple users.
 
@@ -132,20 +226,38 @@ def get_batch_recommendations(request: BatchRequest):
     - Pre-computing homepage recommendations
     - A/B test assignment
     """
+    start_time = time.time()
     pipeline = MODEL_REGISTRY.get("pipeline")
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline not loaded")
 
     results = {}
+    cache_hits = 0
     for cid in request.customer_ids:
+        # Check cache first
+        cache_key = f"{cid}:{request.n_recommendations}"
+        cached = rec_cache.get(cache_key)
+        if cached is not None:
+            results[cid] = [item.article_id for item in cached["items"]]
+            cache_hits += 1
+            continue
+
         try:
             recs = pipeline.recommend(cid, n=request.n_recommendations)
-            results[cid] = recs["article_id"].tolist()
+            rec_list = recs["article_id"].tolist()
+            results[cid] = rec_list
         except Exception as e:
             logger.warning(f"Failed for user {cid}: {e}")
             results[cid] = []
 
-    return {"recommendations": results}
+    total_latency = (time.time() - start_time) * 1000
+    n_users = len(request.customer_ids)
+    return BatchResponse(
+        recommendations=results,
+        total_latency_ms=round(total_latency, 2),
+        avg_latency_ms=round(total_latency / max(n_users, 1), 2),
+        cache_hits=cache_hits,
+    )
 
 
 @app.get("/similar/{article_id}")
