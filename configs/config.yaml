@@ -1,0 +1,90 @@
+# ============================================================
+# H&M Fashion Recommendation System - Configuration
+# ============================================================
+
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  articles_file: "articles_sample.csv"
+  transactions_file: "transactions_sample.csv"
+  customers_file: "customers_sample.csv"
+
+  # Temporal split for evaluation
+  train_end_date: "2020-09-01"
+  val_end_date: "2020-09-08"
+  # Everything after val_end_date is test
+
+pipeline:
+  # Two-stage recommendation
+  candidate_generation:
+    num_candidates: 100  # retrieve top-100 per user
+  ranking:
+    num_final: 12        # re-rank and return top-12
+
+candidates:
+  als:
+    factors: 128
+    regularization: 0.01
+    iterations: 15
+    use_gpu: false
+  content:
+    num_neighbors: 50
+  popularity:
+    time_decay_days: 30
+    top_k: 100
+  recency:
+    lookback_days: 14
+    weight: 2.0
+
+ranking:
+  lgbm:
+    objective: "lambdarank"
+    metric: "ndcg"
+    num_leaves: 63
+    learning_rate: 0.05
+    n_estimators: 300
+    ndcg_eval_at: [12]
+    feature_fraction: 0.8
+    min_child_samples: 20
+
+features:
+  user:
+    - purchase_count
+    - unique_items
+    - avg_price_segment
+    - favorite_section
+    - purchase_recency_days
+    - purchase_frequency
+    - age_group
+    - color_diversity
+  item:
+    - total_purchases
+    - unique_buyers
+    - avg_buyer_age
+    - days_since_first_purchase
+    - repurchase_rate
+    - section_popularity_rank
+  interaction:
+    - user_section_affinity
+    - user_color_affinity
+    - user_product_type_affinity
+    - covisitation_score
+    - als_score
+    - content_similarity_score
+    - time_decay_score
+    - popularity_score
+
+evaluation:
+  k_values: [5, 12, 20]
+  primary_metric: "map@12"
+
+serving:
+  host: "0.0.0.0"
+  port: 8000
+  cache_ttl_seconds: 300
+  max_batch_size: 64
+
+cold_start:
+  new_user_strategy: "popularity_with_demographics"
+  new_item_strategy: "content_similarity"
+  min_interactions_warm: 3
