@@ -1,0 +1,44 @@
+version: "3.9"
+
+services:
+  # Train the recommendation pipeline
+  trainer:
+    build:
+      context: .
+      target: trainer
+    volumes:
+      - ./data/raw:/app/data/raw:ro
+      - ./artifacts:/app/artifacts
+    environment:
+      - OPENBLAS_NUM_THREADS=1
+    command: python train.py --save-artifacts
+
+  # Serve recommendations via FastAPI
+  server:
+    build:
+      context: .
+      target: server
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./artifacts:/app/artifacts:ro
+      - ./data/raw:/app/data/raw:ro
+    environment:
+      - OPENBLAS_NUM_THREADS=1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # Run tests
+  test:
+    build:
+      context: .
+      target: trainer
+    volumes:
+      - ./data/raw:/app/data/raw:ro
+    command: python -m pytest tests/ -v --tb=short
+    profiles:
+      - test

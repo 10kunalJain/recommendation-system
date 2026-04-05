@@ -498,6 +498,8 @@ Random splits allow data leakage — the model can "see" future purchases during
 
 ## Installation & Usage
 
+### Quick Start
+
 ```bash
 git clone https://github.com/10kunalJain/recommendation-system.git
 cd recommendation-system
@@ -505,13 +507,44 @@ conda create -n recsys python=3.12 -y && conda activate recsys
 pip install -r requirements.txt
 ```
 
+### With Make (recommended)
+
+```bash
+make install                        # Install all dependencies + dev tools
+make train                          # Full pipeline: train + evaluate + baselines
+make test                           # Run 49 unit tests
+make serve                          # Start API at localhost:8000
+make lint                           # Lint with ruff
+make docker-build                   # Build Docker images
+make docker-serve                   # Run API in Docker
+```
+
+### Manual Commands
+
 ```bash
 python train.py                     # Full pipeline: train + evaluate + baselines
 python train.py --skip-baselines    # Skip baseline comparison
 python train.py --save-artifacts    # Save model artifacts to disk
 python analyze.py                   # Generate recommendation examples + failure analysis
+python analyze_segments.py          # Segment metrics + latency profiling + business impact
 python visualize.py                 # Generate all architecture/comparison plots
 python serve.py                     # Start API server
+```
+
+### Docker Deployment
+
+```bash
+# Build training and serving images
+docker-compose build
+
+# Train (saves artifacts to ./artifacts/)
+docker-compose run --rm trainer
+
+# Serve (exposes port 8000 with health checks)
+docker-compose up server
+
+# Run tests in Docker
+docker-compose --profile test run --rm test
 ```
 
 ### API Usage
@@ -548,49 +581,101 @@ recs = pipeline.recommend("customer_id_here", n=12)
 # → DataFrame with article_id, rank_score, source_list
 ```
 
-<details>
-<summary><b>Project structure</b></summary>
+---
+
+## Testing & CI/CD
+
+### Automated Test Suite (49 tests)
+
+```bash
+make test          # Run all tests
+make test-cov      # Run with coverage report
+```
+
+| Test Module | Tests | What It Validates |
+|:---|:---|:---|
+| `test_data_loader.py` | 6 | Temporal split integrity, no data leakage, bijective mappings, sparse matrix shape |
+| `test_features.py` | 6 | Feature bounds (diversity in [0,1], non-negative counts), all users covered |
+| `test_candidates.py` | 10 | ALS/content/popularity output validity, fusion scoring, multi-source ranking |
+| `test_evaluation.py` | 11 | Metric correctness (AP@K, NDCG, precision, recall), position sensitivity |
+| `test_ranking.py` | 3 | LambdaRank train/predict, top-K output, feature importance completeness |
+| `test_cold_start.py` | 3 | Cold user detection, new user fallback, diversity cap enforcement |
+
+### GitHub Actions CI Pipeline
+
+Every push triggers:
+1. **Lint** — `ruff` checks for syntax errors and code quality
+2. **Test** — Full test suite with coverage reporting
+3. **Docker Build** — Verifies the container builds and imports succeed
+
+```yaml
+# .github/workflows/ci.yml
+on: [push, pull_request]
+jobs: lint → test (with coverage) → build-docker
+```
+
+---
+
+## Project Structure
 
 ```
 recommendation-system/
-├── configs/config.yaml            # All hyperparameters centralized
-├── train.py                       # Training + evaluation entry point
-├── serve.py                       # FastAPI server entry point
-├── visualize.py                   # Generate architecture/comparison plots
-├── analyze.py                     # Recommendation examples + failure analysis
+├── .github/workflows/ci.yml       # GitHub Actions CI pipeline
+├── Dockerfile                      # Multi-stage build (trainer + server)
+├── docker-compose.yml              # Training, serving, and test services
+├── Makefile                        # Developer commands (train, test, serve, docker)
+├── pyproject.toml                  # Python packaging + pytest/ruff config
+├── requirements.txt                # Pinned dependencies
+├── .env.example                    # Environment variable template
+├── configs/config.yaml             # All hyperparameters centralized
+│
+├── train.py                        # Training + evaluation entry point
+├── serve.py                        # FastAPI server entry point
+├── visualize.py                    # Architecture/comparison plot generation
+├── analyze.py                      # Recommendation examples + failure analysis
+├── analyze_segments.py             # Segment metrics + latency + business impact
+│
 ├── src/
 │   ├── data/
-│   │   └── loader.py              # Data loading, temporal split, sparse matrix
+│   │   └── loader.py               # Data loading, temporal split, sparse matrix
 │   ├── features/
-│   │   └── engineer.py            # User/item/interaction feature engineering
+│   │   └── engineer.py             # User/item/interaction feature engineering
 │   ├── candidates/
-│   │   ├── als_generator.py       # ALS collaborative filtering (implicit)
-│   │   ├── two_tower_generator.py # Two-Tower neural retrieval (PyTorch)
-│   │   ├── content_generator.py   # TF-IDF content similarity
-│   │   ├── popularity_generator.py# Time-decayed popularity + demographics
-│   │   ├── recency_generator.py   # Session-aware recency model
-│   │   └── fusion.py              # Reciprocal rank fusion
+│   │   ├── als_generator.py        # ALS collaborative filtering (implicit)
+│   │   ├── two_tower_generator.py  # Two-Tower neural retrieval (PyTorch)
+│   │   ├── content_generator.py    # TF-IDF content similarity
+│   │   ├── popularity_generator.py # Time-decayed popularity + demographics
+│   │   ├── recency_generator.py    # Session-aware recency model
+│   │   └── fusion.py               # Reciprocal rank fusion
 │   ├── ranking/
-│   │   └── ranker.py              # LightGBM LambdaRank re-ranker
+│   │   └── ranker.py               # LightGBM LambdaRank re-ranker
 │   ├── models/
-│   │   ├── two_tower.py           # Two-Tower architecture (PyTorch)
-│   │   ├── cold_start.py          # New user/item handling
-│   │   ├── diversity.py           # MMR + category diversification
-│   │   └── user_segmentation.py   # K-Means behavioral clustering
+│   │   ├── two_tower.py            # Two-Tower architecture (PyTorch)
+│   │   ├── cold_start.py           # New user/item handling
+│   │   ├── diversity.py            # MMR + category diversification
+│   │   └── user_segmentation.py    # K-Means behavioral clustering
 │   ├── evaluation/
-│   │   ├── metrics.py             # MAP@K, Recall@K, NDCG@K, Precision@K
-│   │   └── baselines.py           # Baseline model comparison
+│   │   ├── metrics.py              # MAP@K, Recall@K, NDCG@K, Precision@K
+│   │   └── baselines.py            # Baseline model comparison
 │   ├── serving/
-│   │   └── api.py                 # FastAPI endpoints
-│   ├── pipeline.py                # End-to-end orchestration
+│   │   └── api.py                  # FastAPI endpoints
+│   ├── pipeline.py                 # End-to-end orchestration
 │   └── utils/
-│       └── config.py              # Configuration loader
-├── data/raw/                      # H&M dataset (articles, transactions, customers)
-├── outputs/plots/                 # Generated visualizations
-└── artifacts/                     # Saved models and caches
+│       └── config.py               # Configuration loader
+│
+├── tests/                          # 49 unit tests
+│   ├── conftest.py                 # Shared fixtures (synthetic data)
+│   ├── test_data_loader.py         # Data integrity tests
+│   ├── test_features.py            # Feature validation tests
+│   ├── test_candidates.py          # Candidate generator tests
+│   ├── test_evaluation.py          # Metric correctness tests
+│   ├── test_ranking.py             # Ranking model tests
+│   └── test_cold_start.py          # Cold start + diversity tests
+│
+├── data/raw/                       # H&M dataset (gitignored)
+├── outputs/plots/                  # Generated visualizations
+└── artifacts/                      # Saved models and caches (gitignored)
 ```
-
-</details>
 
 ---
 
